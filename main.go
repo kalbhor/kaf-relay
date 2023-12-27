@@ -95,17 +95,30 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// create consumer manager
-	m := &consumerManager{mode: mode, reconnectInProgress: StateDisconnected}
-
 	// setup producer
 	p, err := initProducer(ctx, cfg.Producer, logger)
 	if err != nil {
 		log.Fatalf("error starting producer: %v", err)
 	}
 
+	var destTopics []string
+	for _, p := range cfg.Producer.Topics {
+		destTopics = append(destTopics, p)
+	}
+
+	destOffsets, err := getEndOffsets(ctx, p.client, destTopics)
+	if err != nil {
+		log.Fatalf("error fetching destination offsets: %v", err)
+	}
+
+	// create consumer manager
+	m := &consumerManager{
+		mode:                mode,
+		reconnectInProgress: StateDisconnected,
+	}
+
 	// setup consumer
-	if err := initConsumer(ctx, m, cfg.Consumers, cfg.App.MaxFailovers, logger); err != nil {
+	if err := initConsumer(ctx, m, cfg, destOffsets, logger); err != nil {
 		log.Fatalf("error starting consumer: %v", err)
 	}
 
