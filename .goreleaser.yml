@@ -4,14 +4,10 @@ before:
   
 builds:
   - env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
     binary: kaf-relay
     goos:
-      - windows
       - linux
-      - freebsd
-      - openbsd
-      - netbsd
     goarch:
       - amd64
 
