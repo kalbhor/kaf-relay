@@ -10,6 +10,7 @@ import (
 
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/knadh/koanf/v2"
+	"github.com/knadh/profiler"
 	"github.com/zerodha/kaf-relay/internal/relay"
 )
 
@@ -19,6 +20,11 @@ var (
 )
 
 func main() {
+	// Pass one or more modes: Block, Cpu, Goroutine, Mem, Mutex, ThreadCreate, Trace ...
+	p := profiler.New(profiler.Conf{}, profiler.Cpu, profiler.Mem)
+	p.Start()
+	defer p.Stop()
+
 	// Initialize CLI flags.
 	initFlags(ko)
 
