@@ -25,7 +25,7 @@ type Relay struct {
 	topics Topics
 
 	// signalCh is used to signal when the relay poll loop should look for a new healthy server.
-	signalCh chan struct{}
+	signalCh map[string]chan struct{}
 
 	// If stop-at-end is enabled, the "end" offsets of the source
 	// read at the time of boot are cached here to compare against
@@ -58,7 +58,7 @@ func NewRelay(cfg RelayCfg, src *SourcePool, target *Target, topics Topics, filt
 		log:    log,
 
 		topics:   topics,
-		signalCh: make(chan struct{}, 1),
+		signalCh: make(map[string]chan struct{}),
 
 		srcOffsets:    make(map[string]map[int32]int64),
 		targetOffsets: offsets,
@@ -103,12 +103,6 @@ func (re *Relay) Start(globalCtx context.Context) error {
 	// Start the consumer group worker by trigger a signal to the relay loop to fetch
 	// a consumer worker to fetch initial healthy node.
 	re.log.Info("starting consumer worker")
-	// The push is non-blocking to avoid getting stuck trying to send on the poll loop
-	// if the threshold checker go-routine might have already sent on the channel concurrently.
-	select {
-	case re.signalCh <- struct{}{}:
-	default:
-	}
 
 	wg.Add(1)
 	// Relay teardown.
@@ -123,10 +117,28 @@ func (re *Relay) Start(globalCtx context.Context) error {
 
 	// Start the indefinite poll that asks for new connections
 	// and then consumes messages from them.
-	if err := re.startPoll(ctx); err != nil {
-		re.log.Error("error starting consumer worker", "err", err)
+	var pWg sync.WaitGroup
+	for topic := range re.topics {
+		topic := topic
+		sig := make(chan struct{}, 1)
+		re.signalCh[topic] = sig
+
+		// The push is non-blocking to avoid getting stuck trying to send on the poll loop
+		// if the threshold checker go-routine might have already sent on the channel concurrently.
+		select {
+		case sig <- struct{}{}:
+		default:
+		}
+		pWg.Add(1)
+		go func() {
+			defer pWg.Done()
+			if err := re.startPoll(ctx, sig, topic); err != nil {
+				re.log.Error("error starting consumer worker", "err", err)
+			}
+		}()
 	}
 
+	pWg.Wait()
 	// Close the producer inlet channel.
 	close(re.target.inletCh)
 
@@ -139,7 +151,7 @@ func (re *Relay) Start(globalCtx context.Context) error {
 }
 
 // startPoll starts the consumer worker which polls the kafka cluster for messages.
-func (re *Relay) startPoll(ctx context.Context) error {
+func (re *Relay) startPoll(ctx context.Context, sig chan struct{}, topic string) error {
 	var (
 		firstPoll = true
 		server    *Server
@@ -151,7 +163,7 @@ loop:
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case <-re.signalCh:
+		case <-sig:
 			re.log.Info("poll loop received unhealthy signal. requesting new node")
 
 			for {
@@ -164,7 +176,7 @@ loop:
 
 				// Get returns an availably healthy node with a Kafka connection.
 				// This blocks, waits, and retries based on the retry config.
-				s, err := re.source.Get(ctx)
+				s, err := re.source.Get(ctx, topic)
 				if err != nil {
 					re.log.Debug("poll loop could not get healthy node", "error", err)
 					continue
@@ -187,7 +199,7 @@ loop:
 						// The push is non-blocking to avoid getting stuck trying to send on the poll loop
 						// if the threshold checker go-routine might have already sent on the channel concurrently.
 						select {
-						case re.signalCh <- struct{}{}:
+						case sig <- struct{}{}:
 						default:
 						}
 
@@ -210,7 +222,7 @@ loop:
 				// The push is non-blocking to avoid getting stuck trying to send on the poll loop
 				// if the threshold checker go-routine might have already sent on the channel concurrently.
 				select {
-				case re.signalCh <- struct{}{}:
+				case sig <- struct{}{}:
 				default:
 				}
 
@@ -224,7 +236,9 @@ loop:
 				// Always record the latest offsets before the messages are processed for new connections and
 				// retries to consume from where it was left off.
 				// TODO: What if the next step fails? The messages won't be read again?
-				re.source.RecordOffsets(rec)
+				if err := re.source.RecordOffsets(rec); err != nil {
+					return err
+				}
 
 				if err := re.processMessage(ctx, rec); err != nil {
 					re.log.Error("error processing message", "err", err)
