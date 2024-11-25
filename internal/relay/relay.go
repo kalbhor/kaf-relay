@@ -247,6 +247,7 @@ loop:
 			}
 
 			re.log.Debug("processed fetches")
+			// TODO:
 			server.Client.AllowRebalance()
 		}
 	}

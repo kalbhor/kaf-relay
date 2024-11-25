@@ -362,15 +362,30 @@ func (sp *SourcePool) healthcheck(ctx context.Context, signal map[string]chan st
 						return
 					}
 
-					offsets.Each(func(lo kadm.ListedOffset) {
-						servers[idx].Weight[lo.Topic] = lo.Offset
-						sp.setWeight(servers[idx].ID, lo.Offset, lo.Topic)
-
-						// Adjust the global health of the servers.
-						if servers[idx].ID == sp.curCandidate[lo.Topic].ID {
-							curServerWeight[lo.Topic] = lo.Offset
+					hw := make(map[string]int64)
+					for t, p := range offsets.KOffsets() {
+						for _, o := range p {
+							hw[t] += o.EpochOffset().Offset
 						}
-					})
+					}
+
+					for topic := range s.Weight {
+						off, ok := hw[topic]
+						if !ok {
+							servers[idx].Weight[topic] = unhealthyWeight
+							sp.setWeight(servers[idx].ID, unhealthyWeight, topic)
+							continue
+						}
+
+						servers[idx].Weight[topic] = off
+						sp.setWeight(servers[idx].ID, off, topic)
+						// Adjust the global health of the servers.
+						if servers[idx].ID == sp.curCandidate[topic].ID {
+							curServerWeight[topic] = off
+						}
+					}
+
+					log.Printf("high watermark fetched (%v) : %+v", idx, offsets)
 
 				}(i, s)
 			}
