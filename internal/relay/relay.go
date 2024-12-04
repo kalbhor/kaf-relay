@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"log"
 	"log/slog"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ type Relay struct {
 	topics Topics
 
 	// signalCh is used to signal when the relay poll loop should look for a new healthy server.
-	signalCh chan struct{}
+	signalCh map[string]chan struct{}
 
 	// If stop-at-end is enabled, the "end" offsets of the source
 	// read at the time of boot are cached here to compare against
@@ -51,6 +52,11 @@ func NewRelay(cfg RelayCfg, src *SourcePool, target *Target, topics Topics, filt
 		}
 	}
 
+	sigCh := make(map[string]chan struct{}, len(topics))
+	for t := range topics {
+		sigCh[t] = make(chan struct{}, 1)
+	}
+
 	r := &Relay{
 		cfg:    cfg,
 		source: src,
@@ -58,7 +64,7 @@ func NewRelay(cfg RelayCfg, src *SourcePool, target *Target, topics Topics, filt
 		log:    log,
 
 		topics:   topics,
-		signalCh: make(chan struct{}, 1),
+		signalCh: sigCh,
 
 		srcOffsets:    make(map[string]map[int32]int64),
 		targetOffsets: offsets,
@@ -105,9 +111,13 @@ func (re *Relay) Start(globalCtx context.Context) error {
 	re.log.Info("starting consumer worker")
 	// The push is non-blocking to avoid getting stuck trying to send on the poll loop
 	// if the threshold checker go-routine might have already sent on the channel concurrently.
-	select {
-	case re.signalCh <- struct{}{}:
-	default:
+	log.Printf("signalch: %v", len(re.signalCh))
+	for t, sig := range re.signalCh {
+		re.log.Info("sending initial unhealthy sig", "topic", t)
+		select {
+		case sig <- struct{}{}:
+		default:
+		}
 	}
 
 	wg.Add(1)
@@ -117,14 +127,17 @@ func (re *Relay) Start(globalCtx context.Context) error {
 		// Wait till main ctx is cancelled.
 		<-ctx.Done()
 
+		// TODO:
 		// Stop consumer group.
-		re.source.Close()
+		//re.source.Close()
 	}()
 
-	// Start the indefinite poll that asks for new connections
-	// and then consumes messages from them.
-	if err := re.startPoll(ctx); err != nil {
-		re.log.Error("error starting consumer worker", "err", err)
+	for t := range re.signalCh {
+		// Start the indefinite poll that asks for new connections
+		// and then consumes messages from them.
+		if err := re.startPoll(ctx, t); err != nil {
+			re.log.Error("error starting consumer worker", "err", err)
+		}
 	}
 
 	// Close the producer inlet channel.
@@ -140,9 +153,10 @@ func (re *Relay) Start(globalCtx context.Context) error {
 }
 
 // startPoll starts the consumer worker which polls the kafka cluster for messages.
-func (re *Relay) startPoll(ctx context.Context) error {
+func (re *Relay) startPoll(ctx context.Context, topic string) error {
 	var (
 		firstPoll = true
+		sig       = re.signalCh[topic]
 		server    *Server
 	)
 
@@ -152,7 +166,7 @@ loop:
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case <-re.signalCh:
+		case <-sig:
 			re.log.Info("poll loop received unhealthy signal. requesting new node")
 
 			for {
@@ -165,7 +179,7 @@ loop:
 
 				// Get returns an availably healthy node with a Kafka connection.
 				// This blocks, waits, and retries based on the retry config.
-				s, err := re.source.Get(ctx)
+				s, err := re.source.Get(ctx, topic)
 				if err != nil {
 					re.log.Debug("poll loop could not get healthy node", "error", err)
 					continue
@@ -188,7 +202,7 @@ loop:
 						// The push is non-blocking to avoid getting stuck trying to send on the poll loop
 						// if the threshold checker go-routine might have already sent on the channel concurrently.
 						select {
-						case re.signalCh <- struct{}{}:
+						case sig <- struct{}{}:
 						default:
 						}
 
@@ -205,13 +219,14 @@ loop:
 				}
 			}
 
+			log.Printf("fetching fetches (wahh)")
 			fetches, err := re.source.GetFetches(server)
 			if err != nil {
 				re.log.Error("marking server as unhealthy", "server", server.ID)
 				// The push is non-blocking to avoid getting stuck trying to send on the poll loop
 				// if the threshold checker go-routine might have already sent on the channel concurrently.
 				select {
-				case re.signalCh <- struct{}{}:
+				case sig <- struct{}{}:
 				default:
 				}
 

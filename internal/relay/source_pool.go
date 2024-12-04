@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"sync"
@@ -30,10 +31,10 @@ type Server struct {
 	Config ConsumerCfg
 	ID     int
 
-	// Weight is the cumulative high watermark (offset) of every single topic
+	// Weights maps the high watermark (offset) of every relevant topic
 	// on a source. This is used for comparing lags between different sources
 	// based on a threshold. If a server is unhealthy, the weight is marked as -1.
-	Weight int64
+	Weights map[string]int64
 
 	Healthy bool
 
@@ -49,8 +50,8 @@ type TopicOffsets map[string]map[int32]kgo.Offset
 
 // SourcePool manages the source Kafka instances and consumption.
 type SourcePool struct {
-	cfg         SourcePoolCfg
-	client      *kgo.Client
+	cfg SourcePoolCfg
+	//client      *kgo.Client
 	log         *slog.Logger
 	metrics     *metrics.Set
 	targetToSrc map[string]string
@@ -66,17 +67,24 @@ type SourcePool struct {
 	servers []Server
 
 	// The server amongst all the given one's that is best placed to be the current
-	// "healthiest". This is determined by weights (that track offset lag) and status
+	// "healthiest" for a particular topic.
+	// This is determined by weights (that track offset lag) and status
 	// down. It's possible that curCandidate can itself be down or unhealthy,
 	// for instance, when all sources are down. In such a scenario, the poll simply
 	// keeps retriying until a real viable candidate is available.
-	curCandidate Server
+	curCandidate map[string]candidate
 
 	fetchCtx    context.Context
 	fetchCancel context.CancelFunc
 
 	backoffFn func(int) time.Duration
 	sync.Mutex
+}
+
+type candidate struct {
+	topic  string
+	weight int64
+	idx    int
 }
 
 const (
@@ -93,10 +101,15 @@ func NewSourcePool(cfg SourcePoolCfg, serverCfgs []ConsumerCfg, topics Topics, t
 	servers := make([]Server, 0, len(serverCfgs))
 
 	// Initially mark all servers as unhealthy.
+	// XXX
 	for n, c := range serverCfgs {
+		weights := make(map[string]int64, len(topics))
+		for src := range topics {
+			weights[src] = unhealthyWeight
+		}
 		servers = append(servers, Server{
 			ID:      n,
-			Weight:  unhealthyWeight,
+			Weights: weights,
 			Healthy: false,
 			Config:  c,
 		})
@@ -130,29 +143,33 @@ func NewSourcePool(cfg SourcePoolCfg, serverCfgs []ConsumerCfg, topics Topics, t
 func (sp *SourcePool) setInitialOffsets(of TopicOffsets) {
 	// Assign the current weight as initial target offset.
 	// This is done to resume if target already has messages published from src.
-	var w int64
-	for _, p := range of {
+	if sp.curCandidate == nil {
+		sp.curCandidate = make(map[string]candidate)
+	}
+	for t, p := range of {
+		var w int64
 		for _, o := range p {
 			w += o.EpochOffset().Offset
+		}
+		// Set the current candidate with initial weight and a placeholder ID. This initial
+		// weight ensures we resume consuming from where last left off. A real
+		// healthy node should replace this via background checks
+		sp.log.Debug("setting initial target node weight", "weight", w, "topics", t)
+		srcTopic := sp.targetToSrc[t]
+		sp.curCandidate[srcTopic] = candidate{
+			topic: srcTopic,
+			//idx:    -1,
+			weight: w,
 		}
 	}
 
 	sp.targetOffsets = of
-
-	// Set the current candidate with initial weight and a placeholder ID. This initial
-	// weight ensures we resume consuming from where last left off. A real
-	// healthy node should replace this via background checks
-	sp.log.Debug("setting initial target node weight", "weight", w, "topics", of)
-	sp.curCandidate = Server{
-		Healthy: false,
-		Weight:  w,
-	}
 }
 
 // Get attempts return a healthy source Kafka client connection.
 // It internally applies backoff/retries between connection attempts and thus can take
 // indefinitely long to return based on the config.
-func (sp *SourcePool) Get(globalCtx context.Context) (*Server, error) {
+func (sp *SourcePool) Get(globalCtx context.Context, topic string) (*Server, error) {
 	retries := 0
 loop:
 	for {
@@ -165,7 +182,7 @@ loop:
 			}
 
 			// Get the config for a healthy node.
-			s, err := sp.getCurCandidate()
+			s, err := sp.getCurCandidate(topic)
 			if err == nil {
 				sp.log.Debug("attempting new source connection", "id", s.ID, "broker", s.Config.BootstrapBrokers, "retries", retries)
 				conn, err := sp.newConn(globalCtx, s)
@@ -178,7 +195,7 @@ loop:
 				}
 
 				// XXX: Cache the current live connection internally.
-				sp.client = conn
+				//sp.client = conn
 
 				out := s
 				out.Client = conn
@@ -204,7 +221,8 @@ func (sp *SourcePool) GetFetches(s *Server) (kgo.Fetches, error) {
 	if fetches.IsClientClosed() {
 		sp.metrics.GetOrCreateCounter(fmt.Sprintf(SrcKafkaErrMetric, s.ID, "client closed")).Inc()
 		sp.log.Debug("retrieving fetches failed. client closed.", "id", s.ID, "broker", s.Config.BootstrapBrokers)
-		sp.setWeight(s.ID, unhealthyWeight)
+		sp.markUnhealthy(s.ID)
+		//sp.setWeight(s.ID, unhealthyWeight)
 
 		return nil, errors.New("fetch failed")
 	}
@@ -213,7 +231,7 @@ func (sp *SourcePool) GetFetches(s *Server) (kgo.Fetches, error) {
 	for _, err := range fetches.Errors() {
 		sp.metrics.GetOrCreateCounter(fmt.Sprintf(SrcKafkaErrMetric, s.ID, "fetches error")).Inc()
 		sp.log.Error("found error in fetches", "server", s.ID, "error", err.Err)
-		sp.setWeight(s.ID, unhealthyWeight)
+		sp.setWeight(s.ID, err.Topic, unhealthyWeight)
 
 		return nil, errors.New("fetch failed")
 	}
@@ -227,6 +245,8 @@ func (sp *SourcePool) RecordOffsets(rec *kgo.Record) {
 	if sp.targetOffsets == nil {
 		sp.targetOffsets = make(TopicOffsets)
 	}
+
+	topic := sp.sr
 
 	if o, ok := sp.targetOffsets[rec.Topic]; ok {
 		// If the topic already exists, update the offset for the partition.
@@ -244,13 +264,13 @@ func (sp *SourcePool) GetHighWatermark(ctx context.Context, cl *kgo.Client) (kad
 	return getHighWatermark(ctx, cl, sp.srcTopics, sp.cfg.ReqTimeout)
 }
 
-// Close closes the active source Kafka client.
-func (sp *SourcePool) Close() {
-	if sp.client != nil {
-		// Prevent blocking on close.
-		sp.client.PurgeTopicsFromConsuming()
-	}
-}
+// // Close closes the active source Kafka client.
+// func (sp *SourcePool) Close() {
+// 	if sp.client != nil {
+// 		// Prevent blocking on close.
+// 		sp.client.PurgeTopicsFromConsuming()
+// 	}
+// }
 
 // newConn initializes a new consumer group config.
 func (sp *SourcePool) newConn(ctx context.Context, s Server) (*kgo.Client, error) {
@@ -271,7 +291,7 @@ func (sp *SourcePool) newConn(ctx context.Context, s Server) (*kgo.Client, error
 
 // healthcheck indefinitely monitors the health of source (consumer) nodes and keeps the status
 // and weightage of the nodes updated.
-func (sp *SourcePool) healthcheck(ctx context.Context, signal chan struct{}) error {
+func (sp *SourcePool) healthcheck(ctx context.Context, signals map[string]chan struct{}) error {
 	tick := time.NewTicker(sp.cfg.HealthCheckInterval)
 	defer tick.Stop()
 
@@ -324,54 +344,66 @@ func (sp *SourcePool) healthcheck(ctx context.Context, signal chan struct{}) err
 				go func(idx int, s Server) {
 					defer wg.Done()
 
+					id := servers[idx].ID
+
 					// Get the highest offset of all the topics on the source server and sum them up
 					// to derive the weight of the server.
 					sp.log.Debug("getting high watermark via admin client for background check", "id", idx)
 					offsets, err := sp.GetHighWatermark(ctx, clients[idx])
 					if err != nil && offsets == nil {
 						sp.log.Error("error fetching offset in background healthcheck", "id", s.ID, "server", s.Config.BootstrapBrokers, "error", err)
-						sp.setWeight(servers[idx].ID, unhealthyWeight)
+						sp.markUnhealthy(id)
 						return
 					}
 
-					var weight int64 = 0
+					weights := make(map[string]int64) // TODO: re-use
 					offsets.Each(func(lo kadm.ListedOffset) {
-						weight += lo.Offset
+						weights[lo.Topic] += lo.Offset
+						//sp.setWeight(id, lo.Topic, w)
 					})
 
-					// NOTE: Check concurrency.
-					servers[idx].Weight = weight
-
-					// Adjust the global health of the servers.
-					sp.setWeight(servers[idx].ID, weight)
-
-					if servers[idx].ID == sp.curCandidate.ID {
-						curServerWeight = weight
+					for t, w := range weights {
+						sp.setWeight(id, t, w)
+						curr := sp.curCandidate[t]
+						if servers[idx].ID == curr.idx {
+							curr.weight = w
+							sp.curCandidate[t] = curr
+						}
 					}
+
+					// NOTE: Check concurrency.
+					servers[idx].Weights = weights
+
 				}(i, s)
 			}
 			wg.Wait()
 
-			// Now that offsets/weights for all servers are fetched, check if the current server
+			// Now that offsets/weights for all servers are fetched, check if the current server for topics
 			// is lagging beyond the threshold.
-			for _, s := range servers {
-				if sp.curCandidate.ID == s.ID {
-					continue
-				}
+			for topic, curr := range sp.curCandidate {
+				for _, s := range servers {
+					if curr.idx == s.ID {
+						continue
+					}
 
-				if s.Weight-curServerWeight > sp.cfg.LagThreshold {
-					sp.log.Error("current server's lag threshold exceeded. Marking as unhealthy.", "id", s.ID, "server", s.Config.BootstrapBrokers, "diff", s.Weight-curServerWeight > sp.cfg.LagThreshold, "threshold", sp.cfg.LagThreshold)
-					sp.setWeight(s.ID, unhealthyWeight)
+					lag := s.Weights[topic] - curServerWeight
 
-					// Cancel any active fetches.
-					sp.fetchCancel()
+					if lag > sp.cfg.LagThreshold {
+						sig := signals[topic]
+						sp.log.Error("current server's lag threshold exceeded. Marking as unhealthy.", "id", s.ID, "server", s.Config.BootstrapBrokers, "lag", lag, "threshold", sp.cfg.LagThreshold)
+						//sp.setWeight(s.ID, unhealthyWeight)
+						sp.markUnhealthy(s.ID)
 
-					// Signal the relay poll loop to start asking for a healthy client.
-					// The push is non-blocking to avoid getting stuck trying to send on the poll loop
-					// if the poll loop's subsection (checking for errors) has already sent a signal
-					select {
-					case signal <- struct{}{}:
-					default:
+						// Cancel any active fetches.
+						sp.fetchCancel()
+
+						// Signal the relay poll loop to start asking for a healthy client.
+						// The push is non-blocking to avoid getting stuck trying to send on the poll loop
+						// if the poll loop's subsection (checking for errors) has already sent a signal
+						select {
+						case sig <- struct{}{}:
+						default:
+						}
 					}
 				}
 			}
@@ -379,21 +411,22 @@ func (sp *SourcePool) healthcheck(ctx context.Context, signal chan struct{}) err
 	}
 }
 
-var offsetPool = sync.Pool{
-	New: func() interface{} {
-		return make(TopicOffsets)
-	},
-}
+// var offsetPool = sync.Pool{
+// 	New: func() interface{} {
+// 		return make(TopicOffsets)
+// 	},
+// }
 
 // initConsumer initializes a Kafka consumer client. This is used for creating consumer connection to source servers.
 func (sp *SourcePool) initConsumer(cfg ConsumerCfg) (*kgo.Client, error) {
-	srcOffsets := offsetPool.Get().(TopicOffsets)
-	defer func() {
-		for k := range srcOffsets {
-			delete(srcOffsets, k)
-		}
-		offsetPool.Put(srcOffsets)
-	}()
+	// TODO: check for mem usage
+	srcOffsets := make(TopicOffsets)
+	// defer func() {
+	// 	for k := range srcOffsets {
+	// 		delete(srcOffsets, k)
+	// 	}
+	// 	offsetPool.Put(srcOffsets)
+	// }()
 
 	// For each target topic get the relevant src topic to configure direct
 	// consumer to start from target topic's last offset.
@@ -405,6 +438,8 @@ func (sp *SourcePool) initConsumer(cfg ConsumerCfg) (*kgo.Client, error) {
 		srcOffsets[src] = of
 	}
 
+	log.Printf("source offsets: %+v", srcOffsets)
+	log.Printf("consumer-cfg: %+v", cfg)
 	opts := []kgo.Opt{
 		kgo.ConsumePartitions(srcOffsets),
 		kgo.SeedBrokers(cfg.BootstrapBrokers...),
@@ -485,22 +520,24 @@ func (sp *SourcePool) initConsumerClient(cfg ConsumerCfg) (*kgo.Client, error) {
 
 // getCurCandidate returns the most viable candidate server config (highest weight and not down).
 // If everything is down, it returns the one with the highest weight.
-func (sp *SourcePool) getCurCandidate() (Server, error) {
+func (sp *SourcePool) getCurCandidate(topic string) (Server, error) {
 	sp.Lock()
 	defer sp.Unlock()
 
 	// If the weight (sum of all high watermarks of all topics on the source) is -1,
 	// the server is unhealthy.
-	if sp.curCandidate.Weight == unhealthyWeight || !sp.curCandidate.Healthy {
-		return sp.curCandidate, ErrorNoHealthy
+	curr := sp.curCandidate[topic]
+	currServer := sp.servers[curr.idx]
+	if currServer.Weights[topic] == unhealthyWeight || !currServer.Healthy {
+		return currServer, ErrorNoHealthy
 	}
 
-	return sp.curCandidate, nil
+	return currServer, nil
 }
 
 // setWeight updates the weight (cumulative offset highwatermark for all topics on the server)
 // for a particular server. If it's set to -1, the server is assumed to be unhealthy.
-func (sp *SourcePool) setWeight(id int, weight int64) {
+func (sp *SourcePool) setWeight(id int, topic string, weight int64) {
 	sp.Lock()
 	defer sp.Unlock()
 
@@ -509,20 +546,45 @@ func (sp *SourcePool) setWeight(id int, weight int64) {
 			continue
 		}
 
-		s.Weight = weight
-		if s.Weight != unhealthyWeight {
+		s.Weights[topic] = weight
+		if s.Weights[topic] != unhealthyWeight {
 			s.Healthy = true
 		}
 
 		// If the incoming server's weight is greater than the current candidate,
 		// promote that to the current candidate.
-		if weight > sp.curCandidate.Weight {
-			sp.curCandidate = s
+		curr := sp.curCandidate[topic]
+		if weight > sp.servers[curr.idx].Weights[topic] {
+			sp.curCandidate[topic] = candidate{
+				idx:    id,
+				topic:  topic,
+				weight: weight,
+			}
 		}
 
 		sp.metrics.GetOrCreateCounter(fmt.Sprintf(SrcHealthMetric, id)).Set(uint64(weight))
 		sp.log.Debug("setting candidate weight", "id", id, "weight", weight, "curr", sp.curCandidate)
 		sp.servers[id] = s
+		break
+	}
+}
+
+// setWeight updates the weight (cumulative offset highwatermark for all topics on the server)
+// for a particular server. If it's set to -1, the server is assumed to be unhealthy.
+func (sp *SourcePool) markUnhealthy(id int) {
+	sp.Lock()
+	defer sp.Unlock()
+
+	for _, s := range sp.servers {
+		if s.ID != id {
+			continue
+		}
+
+		for t := range s.Weights {
+			s.Weights[t] = unhealthyWeight
+			//s.Healthy = false
+		}
+
 		break
 	}
 }
