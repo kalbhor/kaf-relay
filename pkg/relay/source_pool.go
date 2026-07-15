@@ -27,6 +27,7 @@ type sourceNodeMetrics struct {
 type sourceMetrics struct {
 	unhealthy         *metrics.Counter
 	candidateSwitches *metrics.Counter
+	candidateBehind   *metrics.Counter
 	nodes             map[int]*sourceNodeMetrics
 }
 
@@ -34,6 +35,7 @@ func newSourceMetrics(set *metrics.Set, servers []Server) sourceMetrics {
 	sm := sourceMetrics{
 		unhealthy:         set.GetOrCreateCounter(MetricName(MetricSourceUnhealthy)),
 		candidateSwitches: set.GetOrCreateCounter(MetricName(MetricCandidateSwitches)),
+		candidateBehind:   set.GetOrCreateCounter(MetricName(MetricCandidateBehind)),
 		nodes:             make(map[int]*sourceNodeMetrics, len(servers)),
 	}
 	for _, s := range servers {
@@ -111,6 +113,10 @@ type SourcePool struct {
 	fetchCtx    context.Context
 	cancelFetch context.CancelFunc
 
+	// forceCheckCh nudges the healthcheck loop to run a round immediately,
+	// e.g. when a candidate is refused for lagging behind the resume offset.
+	forceCheckCh chan struct{}
+
 	backoffFn func(int) time.Duration
 	sync.Mutex
 }
@@ -121,6 +127,12 @@ const (
 
 var (
 	ErrorNoHealthy = errors.New("no healthy node")
+
+	// ErrCandidateBehind is returned by the pool when the best available
+	// candidate's high watermark hasn't caught up with the stored resume
+	// offset yet. It is a transient state: the pool retries until a
+	// healthcheck reports the candidate has caught up.
+	ErrCandidateBehind = errors.New("candidate high watermark behind resume offset")
 )
 
 // NewSourcePool returns a controller instance that manages the lifecycle of a pool of N source (consumer)
@@ -139,12 +151,13 @@ func NewSourcePool(cfg SourcePoolCfg, serverCfgs []ConsumerCfg, topic Topic, tar
 	}
 
 	sp := &SourcePool{
-		cfg:       cfg,
-		topic:     topic,
-		servers:   servers,
-		log:       log,
-		metr:      newSourceMetrics(m, servers),
-		backoffFn: GetBackoffFn(cfg.EnableBackoff, cfg.BackoffMin, cfg.BackoffMax),
+		cfg:          cfg,
+		topic:        topic,
+		servers:      servers,
+		log:          log,
+		metr:         newSourceMetrics(m, servers),
+		backoffFn:    GetBackoffFn(cfg.EnableBackoff, cfg.BackoffMin, cfg.BackoffMax),
+		forceCheckCh: make(chan struct{}, 1),
 	}
 
 	sp.setInitialOffsets(targetOffsets)
@@ -210,6 +223,16 @@ loop:
 				sp.fetchCtx, sp.cancelFetch = context.WithCancel(globalCtx)
 				sp.Unlock()
 				return &out, nil
+			}
+
+			// A candidate that merely lags the resume offset passes once its
+			// high watermark catches up; nudge the healthcheck to refresh
+			// weights now instead of waiting for its next tick.
+			if errors.Is(err, ErrCandidateBehind) {
+				select {
+				case sp.forceCheckCh <- struct{}{}:
+				default:
+				}
 			}
 
 			retries++
@@ -311,109 +334,119 @@ func (sp *SourcePool) healthcheck(ctx context.Context, signal chan struct{}) err
 			return ctx.Err()
 
 		case <-tick.C:
-			// Fetch offset counts for each server.
-			wg := &sync.WaitGroup{}
+		case <-sp.forceCheckCh:
+			sp.log.Debug("running forced health check")
+		}
 
-			currActiveWeight := unhealthyWeight
-			for i, s := range servers {
-				sp.log.Debug("running background health check", "id", s.ID, "server", s.Config.BootstrapBrokers)
+		sp.checkServers(ctx, servers, clients, signal)
+	}
+}
 
-				// For the first ever check, clients will be nil.
-				if clients[i] == nil {
-					sp.log.Debug("initializing admin client for background check", "id", s.ID, "server", s.Config.BootstrapBrokers)
-					cl, err := sp.initConsumerClient(s.Config)
-					if err != nil {
-						sp.log.Error("error initializing admin client in background healthcheck", "id", s.ID, "server", s.Config.BootstrapBrokers, "error", err)
-						continue
-					}
+// checkServers runs a single health check round: it refreshes every server's
+// weight (cumulative high watermark) and signals the relay poll loop if the
+// current server lags behind another server beyond the configured threshold.
+func (sp *SourcePool) checkServers(ctx context.Context, servers []Server, clients []*kgo.Client, signal chan struct{}) {
+	// Fetch offset counts for each server.
+	wg := &sync.WaitGroup{}
 
-					sp.log.Debug("initialized admin client for background check", "id", s.ID, "server", s.Config.BootstrapBrokers)
-					clients[i] = cl
-				}
+	currActiveWeight := unhealthyWeight
+	for i, s := range servers {
+		sp.log.Debug("running background health check", "id", s.ID, "server", s.Config.BootstrapBrokers)
 
-				// Spawn a goroutine for the client to concurrently fetch its offsets. The waitgroup
-				// ensures that offsets for all servers are fetched and then tallied together for healthcheck.
-				wg.Add(1)
-				go func(idx int, s Server) {
-					defer wg.Done()
-
-					// Get the highest offset of all the topics on the source server and sum them up
-					// to derive the weight of the server.
-					sp.log.Debug("getting high watermark via admin client for background check", "id", idx)
-					offsets, err := sp.GetHighWatermark(ctx, clients[idx])
-					if err != nil && offsets == nil {
-						sp.log.Error("error fetching offset in background healthcheck", "id", s.ID, "server", s.Config.BootstrapBrokers, "error", err)
-						sp.setWeight(servers[idx].ID, unhealthyWeight)
-						// If the current candidate is no longer healthy,
-						// signal relay to stop polling it.
-						sp.Lock()
-						var (
-							shouldCancel = s.ID == sp.lastSentID
-							cancelFn     = sp.cancelFetch
-						)
-						sp.Unlock()
-
-						if shouldCancel && cancelFn != nil {
-							cancelFn()
-						}
-
-						return
-					}
-
-					var weight int64 = 0
-					offsets.Each(func(lo kadm.ListedOffset) {
-						weight += lo.Offset
-					})
-
-					// NOTE: Check concurrency.
-					servers[idx].Weight = weight
-
-					// Adjust the global health of the servers.
-					sp.setWeight(servers[idx].ID, weight)
-
-					sp.Lock()
-					if servers[idx].ID == sp.lastSentID {
-						currActiveWeight = weight
-					}
-					sp.Unlock()
-				}(i, s)
+		// For the first ever check, clients will be nil.
+		if clients[i] == nil {
+			sp.log.Debug("initializing admin client for background check", "id", s.ID, "server", s.Config.BootstrapBrokers)
+			cl, err := sp.initConsumerClient(s.Config)
+			if err != nil {
+				sp.log.Error("error initializing admin client in background healthcheck", "id", s.ID, "server", s.Config.BootstrapBrokers, "error", err)
+				continue
 			}
-			wg.Wait()
 
-			// Now that offsets/weights for all servers are fetched, check if the current server
-			// is lagging beyond the threshold.
-			for _, s := range servers {
-				// If the current server is now unhealthy skip checking for lag since we're in the
-				// process of picking a new candidate.
+			sp.log.Debug("initialized admin client for background check", "id", s.ID, "server", s.Config.BootstrapBrokers)
+			clients[i] = cl
+		}
+
+		// Spawn a goroutine for the client to concurrently fetch its offsets. The waitgroup
+		// ensures that offsets for all servers are fetched and then tallied together for healthcheck.
+		wg.Add(1)
+		go func(idx int, s Server) {
+			defer wg.Done()
+
+			// Get the highest offset of all the topics on the source server and sum them up
+			// to derive the weight of the server.
+			sp.log.Debug("getting high watermark via admin client for background check", "id", idx)
+			offsets, err := sp.GetHighWatermark(ctx, clients[idx])
+			if err != nil && offsets == nil {
+				sp.log.Error("error fetching offset in background healthcheck", "id", s.ID, "server", s.Config.BootstrapBrokers, "error", err)
+				sp.setWeight(servers[idx].ID, unhealthyWeight)
+				// If the current candidate is no longer healthy,
+				// signal relay to stop polling it.
 				sp.Lock()
-				lastSent := sp.lastSentID
+				var (
+					shouldCancel = s.ID == sp.lastSentID
+					cancelFn     = sp.cancelFetch
+				)
 				sp.Unlock()
-				if lastSent == s.ID || currActiveWeight == unhealthyWeight {
-					continue
+
+				if shouldCancel && cancelFn != nil {
+					cancelFn()
 				}
 
-				sp.log.Debug("checking current server's lag", "id", s.ID, "server", s.Config.BootstrapBrokers, "s.weight", s.Weight, "curr", currActiveWeight, "diff", s.Weight-currActiveWeight, "threshold", sp.cfg.LagThreshold)
-				if s.Weight-currActiveWeight > sp.cfg.LagThreshold {
-					sp.log.Error("current server's lag threshold exceeded. Marking as unhealthy.", "id", s.ID, "server", s.Config.BootstrapBrokers, "diff", s.Weight-currActiveWeight > sp.cfg.LagThreshold, "threshold", sp.cfg.LagThreshold)
-					sp.metr.nodes[s.ID].lagThresholdExceeded.Inc()
-					sp.setWeight(s.ID, unhealthyWeight)
+				return
+			}
 
-					// Cancel any active fetches.
-					sp.Lock()
-					cancelFn := sp.cancelFetch
-					sp.Unlock()
-					if cancelFn != nil {
-						cancelFn()
-					}
+			var weight int64 = 0
+			offsets.Each(func(lo kadm.ListedOffset) {
+				weight += lo.Offset
+			})
 
-					// Signal the relay poll loop to start asking for a healthy client.
-					// The push is non-blocking to avoid getting stuck trying to send on the poll loop
-					// if the poll loop's subsection (checking for errors) has already sent a signal
-					select {
-					case signal <- struct{}{}:
-					default:
-					}
-				}
+			// NOTE: Check concurrency.
+			servers[idx].Weight = weight
+
+			// Adjust the global health of the servers.
+			sp.setWeight(servers[idx].ID, weight)
+
+			sp.Lock()
+			if servers[idx].ID == sp.lastSentID {
+				currActiveWeight = weight
+			}
+			sp.Unlock()
+		}(i, s)
+	}
+	wg.Wait()
+
+	// Now that offsets/weights for all servers are fetched, check if the current server
+	// is lagging beyond the threshold.
+	for _, s := range servers {
+		// If the current server is now unhealthy skip checking for lag since we're in the
+		// process of picking a new candidate.
+		sp.Lock()
+		lastSent := sp.lastSentID
+		sp.Unlock()
+		if lastSent == s.ID || currActiveWeight == unhealthyWeight {
+			continue
+		}
+
+		sp.log.Debug("checking current server's lag", "id", s.ID, "server", s.Config.BootstrapBrokers, "s.weight", s.Weight, "curr", currActiveWeight, "diff", s.Weight-currActiveWeight, "threshold", sp.cfg.LagThreshold)
+		if s.Weight-currActiveWeight > sp.cfg.LagThreshold {
+			sp.log.Error("current server's lag threshold exceeded. Marking as unhealthy.", "id", s.ID, "server", s.Config.BootstrapBrokers, "diff", s.Weight-currActiveWeight > sp.cfg.LagThreshold, "threshold", sp.cfg.LagThreshold)
+			sp.metr.nodes[s.ID].lagThresholdExceeded.Inc()
+			sp.setWeight(s.ID, unhealthyWeight)
+
+			// Cancel any active fetches.
+			sp.Lock()
+			cancelFn := sp.cancelFetch
+			sp.Unlock()
+			if cancelFn != nil {
+				cancelFn()
+			}
+
+			// Signal the relay poll loop to start asking for a healthy client.
+			// The push is non-blocking to avoid getting stuck trying to send on the poll loop
+			// if the poll loop's subsection (checking for errors) has already sent a signal
+			select {
+			case signal <- struct{}{}:
+			default:
 			}
 		}
 	}
@@ -430,6 +463,12 @@ func (sp *SourcePool) initConsumer(cfg ConsumerCfg) (*kgo.Client, error) {
 	sp.log.Info("initializing new source consumer", "offsets", cp, "brokers", cfg.BootstrapBrokers)
 	opts := []kgo.Opt{
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{sp.topic.SourceTopic: cp}),
+		// Fail loudly on OffsetOutOfRange instead of franz-go's default of
+		// resetting to the earliest offset, which would silently re-relay the
+		// entire retained source log to the target. With NoResetOffset the
+		// fetch surfaces the error, the node is marked unhealthy, and the
+		// pool falls back to a node that has the offset.
+		kgo.ConsumeResetOffset(kgo.NoResetOffset()),
 		kgo.SeedBrokers(cfg.BootstrapBrokers...),
 		kgo.FetchMaxWait(sp.cfg.ReqTimeout),
 	}
@@ -517,6 +556,25 @@ func (sp *SourcePool) getCurCandidate() (Server, error) {
 	// the server is unhealthy.
 	if sp.curCandidate.Weight == unhealthyWeight || !sp.curCandidate.Healthy {
 		return sp.curCandidate, ErrorNoHealthy
+	}
+
+	// Hand out a candidate only after its high watermark has caught up with
+	// the stored resume offset. One node's tip can trail another's, and
+	// resuming past a node's high watermark raises OffsetOutOfRange on the
+	// first fetch (see initConsumer). Get() forces a healthcheck and retries
+	// until the candidate catches up.
+	//
+	// NOTE: Weights are summed across partitions, which is exact only for
+	// single-partition topics.
+	var resume int64
+	for _, o := range sp.targetOffsets {
+		resume += o
+	}
+
+	if sp.curCandidate.Weight < resume {
+		sp.metr.candidateBehind.Inc()
+		return sp.curCandidate, fmt.Errorf("%w: node %d weight %d < resume offset %d",
+			ErrCandidateBehind, sp.curCandidate.ID, sp.curCandidate.Weight, resume)
 	}
 
 	sp.lastSentID = sp.curCandidate.ID

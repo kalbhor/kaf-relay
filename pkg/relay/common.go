@@ -40,6 +40,7 @@ const (
 	MetricFlushDuration        = "target_flush_duration_seconds"
 	MetricFlushRetries         = "target_flush_retries_total"
 	MetricCandidateSwitches    = "source_candidate_switches_total"
+	MetricCandidateBehind      = "source_candidate_behind_total"
 	MetricSourceConnections    = "source_connections_total"
 	MetricLagThresholdExceeded = "source_lag_threshold_exceeded_total"
 
