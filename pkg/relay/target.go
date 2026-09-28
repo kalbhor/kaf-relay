@@ -8,6 +8,9 @@ type Header struct {
 	Value []byte
 }
 
+// SourcePartition as a Message.Partition asks the target to write to the partition the message was read from.
+const SourcePartition int32 = -1
+
 // Message is a single Kafka message flowing through the relay pipeline.
 // The relay converts source Kafka records into Message{}s before
 // passing them to a Target.
@@ -16,7 +19,7 @@ type Message struct {
 	Value           []byte
 	Headers         []Header
 	Topic           string // Target topic
-	Partition       int32  // Target partition (-1 for auto)
+	Partition       int32  // Target partition, or SourcePartition to mirror the source.
 	Offset          int64  // Source message offset.
 	SourcePartition int32  // Source partition (for offset tracking by targets).
 }

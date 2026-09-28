@@ -2,6 +2,8 @@ package relay
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -15,6 +17,10 @@ import (
 type RelayCfg struct {
 	StopAtEnd bool
 }
+
+// ErrPartitionCountMismatch is returned when source partitions are mapped 1:1 to
+// target partitions but the two topics have a different number of partitions.
+var ErrPartitionCountMismatch = errors.New("source and target partition counts differ")
 
 // relayMetrics holds the per-relay counters that are relay-level concerns
 // (as opposed to target-level concerns like flush errors).
@@ -175,8 +181,9 @@ func (re *Relay) Start(globalCtx context.Context) error {
 
 	// Start the indefinite poll that asks for new connections
 	// and then consumes messages from them.
-	if err := re.startPoll(ctx); err != nil {
-		re.log.Error("error starting consumer worker", "err", err)
+	pollErr := re.startPoll(ctx)
+	if pollErr != nil {
+		re.log.Error("error starting consumer worker", "err", pollErr)
 	}
 
 	// Signal the target to drain and shut down.
@@ -184,6 +191,11 @@ func (re *Relay) Start(globalCtx context.Context) error {
 
 	cancel()
 	wg.Wait()
+
+	// A partition count mismatch is a config error, so surface it instead of idling.
+	if errors.Is(pollErr, ErrPartitionCountMismatch) {
+		return pollErr
+	}
 
 	return nil
 }
@@ -224,6 +236,23 @@ loop:
 				re.log.Info("poll loop got new healthy node", "id", s.ID, "server", s.Config.BootstrapBrokers)
 				server = s
 				break
+			}
+
+			if re.topic.AutoTargetPartition {
+				if err := re.checkPartitionCount(ctx, server.Client); err != nil {
+					if errors.Is(err, ErrPartitionCountMismatch) {
+						return err
+					}
+
+					re.log.Error("could not verify partition counts; sending unhealthy signal", "id", server.ID, "server", server.Config.BootstrapBrokers, "error", err)
+					// Non-blocking push to avoid getting stuck.
+					select {
+					case re.signalCh <- struct{}{}:
+					default:
+					}
+
+					continue loop
+				}
 			}
 
 		default:
@@ -294,6 +323,31 @@ loop:
 	}
 }
 
+// checkPartitionCount returns ErrPartitionCountMismatch if the source topic on the
+// given client and the target topic have a different number of partitions.
+func (re *Relay) checkPartitionCount(ctx context.Context, cl *kgo.Client) error {
+	src, err := re.source.GetHighWatermark(ctx, cl)
+	if err != nil {
+		return err
+	}
+
+	tgt, err := re.target.GetHighWatermark(ctx)
+	if err != nil {
+		return err
+	}
+
+	var srcCount int
+	src.Each(func(kadm.ListedOffset) { srcCount++ })
+	tgtCount := len(tgt[re.topic.TargetTopic])
+
+	if srcCount != tgtCount {
+		return fmt.Errorf("%w: %s has %d, %s has %d", ErrPartitionCountMismatch,
+			re.topic.SourceTopic, srcCount, re.topic.TargetTopic, tgtCount)
+	}
+
+	return nil
+}
+
 // processMessage processes the given message and forwards it to the target.
 func (re *Relay) processMessage(ctx context.Context, rec *kgo.Record) error {
 	// Decrement the end offsets for the given topic and partition till we reach 0
@@ -322,7 +376,8 @@ func (re *Relay) processMessage(ctx context.Context, rec *kgo.Record) error {
 	// Build the relay.Message from the source kgo.Record.
 	// Add the source message timestamp as a meta header (_t) so that downstream
 	// consumers can compute source→target lag if needed.
-	partition := int32(-1) // auto-partition
+	// Mirror the source partition unless a fixed target partition is configured.
+	partition := SourcePartition
 	if !re.topic.AutoTargetPartition {
 		partition = int32(re.topic.TargetPartition)
 	}
@@ -349,7 +404,11 @@ func (re *Relay) processMessage(ctx context.Context, rec *kgo.Record) error {
 	}
 
 	// Track the relay count per source→target topic-partition pair.
-	re.metr.incRelayed(rec.Topic, rec.Partition, re.topic.TargetTopic, partition)
+	tgtPartition := partition
+	if tgtPartition == SourcePartition {
+		tgtPartition = rec.Partition
+	}
+	re.metr.incRelayed(rec.Topic, rec.Partition, re.topic.TargetTopic, tgtPartition)
 
 	return nil
 }

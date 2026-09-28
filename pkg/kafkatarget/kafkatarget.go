@@ -172,15 +172,17 @@ func (tg *Target) Start() error {
 // Write converts a relay.Message to a kgo.Record and enqueues it for production.
 // Blocks if the internal buffer is full.
 func (tg *Target) Write(ctx context.Context, msg relay.Message) error {
-	rec := &kgo.Record{
-		Key:   msg.Key,
-		Value: msg.Value,
-		Topic: msg.Topic,
+	// The client uses a manual partitioner, so the record goes to exactly this partition.
+	partition := msg.Partition
+	if partition == relay.SourcePartition {
+		partition = msg.SourcePartition
 	}
 
-	// -1 means auto-partition (let the partitioner decide).
-	if msg.Partition >= 0 {
-		rec.Partition = msg.Partition
+	rec := &kgo.Record{
+		Key:       msg.Key,
+		Value:     msg.Value,
+		Topic:     msg.Topic,
+		Partition: partition,
 	}
 
 	for _, h := range msg.Headers {
