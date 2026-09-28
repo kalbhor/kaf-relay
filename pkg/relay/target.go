@@ -46,3 +46,10 @@ type Target interface {
 	// Close closes the target and waits until all pending messages are flushed.
 	Close() error
 }
+
+// PartitionCounter is an optional Target interface for targets with Kafka-style partitions.
+// When implemented, the relay checks that the source and target partition counts match
+// before mirroring source partitions.
+type PartitionCounter interface {
+	PartitionCount(ctx context.Context, topic string) (int, error)
+}

@@ -113,6 +113,29 @@ func (tg *Target) GetHighWatermark(ctx context.Context) (relay.Offsets, error) {
 	return out, nil
 }
 
+var _ relay.PartitionCounter = (*Target)(nil)
+
+// PartitionCount returns the number of partitions of the given target topic.
+func (tg *Target) PartitionCount(ctx context.Context, topic string) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, tg.cfg.ReqTimeout)
+	defer cancel()
+
+	topics, err := kadm.NewClient(tg.client).ListTopics(ctx, topic)
+	if err != nil {
+		return 0, err
+	}
+
+	t, ok := topics[topic]
+	if !ok {
+		return 0, fmt.Errorf("topic %s not found", topic)
+	}
+	if t.Err != nil {
+		return 0, t.Err
+	}
+
+	return len(t.Partitions), nil
+}
+
 // Start runs the blocking batch/flush loop.
 // It reads messages from the internal channel, batches them, and flushes
 // to Kafka periodically or when the batch is full.

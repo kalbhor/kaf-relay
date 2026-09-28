@@ -53,6 +53,20 @@ func TestRelayPreservesSourcePartitions(t *testing.T) {
 	}
 }
 
+func TestCheckPartitionCountSkipsOtherTargets(t *testing.T) {
+	r, err := NewRelay(RelayCfg{}, nil, &recordingTarget{}, Topic{
+		SourceTopic: "source", TargetTopic: "target", AutoTargetPartition: true,
+	}, nil, metrics.NewSet(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The source pool is nil, so this panics if the check doesn't skip the target.
+	if err := r.checkPartitionCount(context.Background(), nil); err != nil {
+		t.Fatalf("checkPartitionCount() = %v, want nil", err)
+	}
+}
+
 func TestRelayExplicitTargetPartition(t *testing.T) {
 	target := &recordingTarget{}
 	r, err := NewRelay(RelayCfg{}, nil, target, Topic{

@@ -325,20 +325,25 @@ loop:
 
 // checkPartitionCount returns ErrPartitionCountMismatch if the source topic on the
 // given client and the target topic have a different number of partitions.
+// It is a no-op for targets that don't implement PartitionCounter.
 func (re *Relay) checkPartitionCount(ctx context.Context, cl *kgo.Client) error {
+	pc, ok := re.target.(PartitionCounter)
+	if !ok {
+		return nil
+	}
+
 	src, err := re.source.GetHighWatermark(ctx, cl)
 	if err != nil {
 		return err
 	}
 
-	tgt, err := re.target.GetHighWatermark(ctx)
+	tgtCount, err := pc.PartitionCount(ctx, re.topic.TargetTopic)
 	if err != nil {
 		return err
 	}
 
 	var srcCount int
 	src.Each(func(kadm.ListedOffset) { srcCount++ })
-	tgtCount := len(tgt[re.topic.TargetTopic])
 
 	if srcCount != tgtCount {
 		return fmt.Errorf("%w: %s has %d, %s has %d", ErrPartitionCountMismatch,
