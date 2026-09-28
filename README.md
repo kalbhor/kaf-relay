@@ -146,7 +146,7 @@ func (r *RedisTarget) Write(ctx context.Context, msg relay.Message) error {
 	})
 
 	// Persist the source offset for GetHighWatermark() (for relay resumption).
-	pipe.HSet(ctx, watermarkKey, fmt.Sprintf("%d", msg.Partition), msg.Offset)
+	pipe.HSet(ctx, watermarkKey, fmt.Sprintf("%d", msg.SourcePartition), msg.Offset)
 
 	_, err := pipe.Exec(ctx)
 	return err
