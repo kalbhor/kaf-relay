@@ -30,8 +30,9 @@ type Offsets map[string]map[int32]int64
 // Target is the interface for a relay target/destination. The bundled `kafkatarget` package implements this for Kafka.
 // This interface can be implemented to relay messages to other systems (Redis, HTTP, etc.).
 type Target interface {
-	// GetHighWatermark returns the target's current offsets per topic-partition, which is then
-	// used by the relay to resume consumption from the source.
+	// GetHighWatermark returns, per topic and source partition, the next source offset to
+	// consume (the last written Message.Offset + 1). The relay resumes from these offsets and
+	// consumes partitions that aren't listed from the start.
 	// Targets that don't/can't track offsets should return empty Offsets and nil, NOT an error.
 	GetHighWatermark(ctx context.Context) (Offsets, error)
 
