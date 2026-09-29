@@ -206,6 +206,7 @@ func (tg *Target) Write(ctx context.Context, msg relay.Message) error {
 		Value:     msg.Value,
 		Topic:     msg.Topic,
 		Partition: partition,
+		Headers:   make([]kgo.RecordHeader, 0, len(msg.Headers)),
 	}
 
 	for _, h := range msg.Headers {

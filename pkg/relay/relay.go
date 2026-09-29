@@ -394,10 +394,9 @@ func (re *Relay) processMessage(ctx context.Context, rec *kgo.Record) error {
 		Partition:       partition,
 		Offset:          rec.Offset,
 		SourcePartition: rec.Partition,
-		Headers: []Header{
-			{Key: "_t", Value: nsToBytes(rec.Timestamp.UnixNano())},
-		},
+		Headers:         make([]Header, 0, len(rec.Headers)+1),
 	}
+	msg.Headers = append(msg.Headers, Header{Key: "_t", Value: nsToBytes(rec.Timestamp.UnixNano())})
 
 	// Copy any existing headers from the source record.
 	for _, h := range rec.Headers {
