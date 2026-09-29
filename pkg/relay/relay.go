@@ -207,6 +207,13 @@ func (re *Relay) startPoll(ctx context.Context) error {
 		server    *Server
 	)
 
+	// Close the last source client when the poll loop exits.
+	defer func() {
+		if server != nil {
+			server.Client.Close()
+		}
+	}()
+
 loop:
 	for {
 		select {
@@ -234,6 +241,11 @@ loop:
 				}
 
 				re.log.Info("poll loop got new healthy node", "id", s.ID, "server", s.Config.BootstrapBrokers)
+
+				// Close the previous source client before switching to the new one.
+				if server != nil {
+					server.Client.Close()
+				}
 				server = s
 				break
 			}

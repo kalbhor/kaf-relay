@@ -241,15 +241,16 @@ func (tg *Target) Write(ctx context.Context, msg relay.Message) error {
 func (tg *Target) Close() error {
 	tg.closeOnce.Do(func() {
 		close(tg.inletCh)
+
+		// Wait for Start() to finish draining.
+		<-tg.doneCh
+
+		if tg.client != nil {
+			// Purge first so closing doesn't block on undelivered records.
+			tg.client.PurgeTopicsFromProducing()
+			tg.client.Close()
+		}
 	})
-
-	// Wait for Start() to finish draining.
-	<-tg.doneCh
-
-	if tg.client != nil {
-		// Prevent blocking on close.
-		tg.client.PurgeTopicsFromProducing()
-	}
 	return nil
 }
 

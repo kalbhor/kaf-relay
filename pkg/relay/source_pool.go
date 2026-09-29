@@ -219,7 +219,11 @@ loop:
 				sp.metr.nodes[s.ID].connections.Inc()
 
 				// Lock because sp.cancelFetch could be accessed by healthcheck() goroutine.
+				// The previous fetch context is cancelled so it isn't left attached to globalCtx.
 				sp.Lock()
+				if sp.cancelFetch != nil {
+					sp.cancelFetch()
+				}
 				sp.fetchCtx, sp.cancelFetch = context.WithCancel(globalCtx)
 				sp.Unlock()
 				return &out, nil
